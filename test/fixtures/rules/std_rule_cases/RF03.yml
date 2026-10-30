@@ -1634,3 +1634,74 @@ test_fail_sqlite_order_by_function_with_unqualified_reference:
   configs:
     core:
       dialect: sqlite
+
+test_pass_postgres_update_where_exists_dml_target_8714:
+  # The UPDATE target is visible to the subquery. RF03 must not strip either
+  # qualifier and turn `l.id = o.id` into the always-true `id = id`.
+  pass_str: |
+    update orders as o
+    set x = 1
+    where exists (
+      select 1 from lines as l where l.id = o.id
+    );
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: unqualified
+
+test_pass_postgres_update_scalar_subquery_dml_target_8714:
+  pass_str: |
+    update orders as o
+    set x = (
+      select l.x from lines as l where l.id = o.id
+    );
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: unqualified
+
+test_pass_postgres_delete_where_exists_dml_target_8714:
+  pass_str: |
+    delete from orders as o
+    where exists (
+      select 1 from lines as l where l.id = o.id
+    );
+  configs:
+    core:
+      dialect: postgres
+    rules:
+      references.consistent:
+        single_table_references: unqualified
+
+test_pass_tsql_update_from_cross_apply_dml_target_8714:
+  pass_str: |
+    update o
+    set x = s.j
+    from orders as o
+    cross apply (
+      select l.x as j from lines as l where l.id = o.id
+    ) as s;
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.consistent:
+        single_table_references: unqualified
+
+test_pass_tsql_merge_dml_target_8714:
+  pass_str: |
+    merge into t using s on t.id = s.id
+    when matched then
+      update set t.y = (
+        select m.y from m where m.id = t.id
+      );
+  configs:
+    core:
+      dialect: tsql
+    rules:
+      references.consistent:
+        single_table_references: unqualified

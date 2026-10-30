@@ -8,6 +8,7 @@ from sqlfluff.core.dialects.common import (
     ColumnAliasInfo,
     ObjectReferenceLevel,
     extract_possible_references,
+    get_from_clause_aliases,
     is_qualified,
     iter_raw_references,
     qualification,
@@ -26,7 +27,15 @@ from sqlfluff.dialects.dialect_ansi import ObjectReferenceSegment
 from sqlfluff.utils.analysis.query import Query
 from sqlfluff.utils.analysis.select import SelectStatementColumnsAndTables
 
-_START_TYPES = ["select_statement", "set_expression", "with_compound_statement"]
+_START_TYPES = [
+    "select_statement",
+    "set_expression",
+    "with_compound_statement",
+    "update_statement",
+    "delete_statement",
+    "merge_statement",
+]
+_DML_TYPES = ("update_statement", "delete_statement", "merge_statement")
 
 
 class Rule_RF03(BaseRule):
@@ -117,13 +126,12 @@ class Rule_RF03(BaseRule):
         self, query: Query, subquery: Optional[Query] = None
     ) -> Iterator[AliasInfo]:
         """Iterate along a list of valid alias targets."""
+        seen_ref_strs: set[str] = set()
         for selectable in query.selectables:
             select_info = selectable.select_info
             if select_info:
                 for alias in select_info.table_aliases:
-                    if subquery and alias.from_expression_element.path_to(
-                        subquery.selectables[0].selectable
-                    ):
+                    if _is_subquery_target_alias(alias, subquery):
                         # Skip the subquery alias itself
                         continue
                     # Tables without an alias name (e.g. unaliased T-SQL table
@@ -131,7 +139,20 @@ class Rule_RF03(BaseRule):
                     # subquery can still see their columns, and reference them
                     # by their bracketed name (e.g. `[@orders].id`).
                     if alias.ref_str or subquery:
+                        seen_ref_strs.add(alias.ref_str)
                         yield alias
+        # DML statements are modelled as selectables without a FROM list. The
+        # target table (and, for T-SQL UPDATE, the tables in FROM) is still
+        # visible to subqueries in the statement, so add those aliases too.
+        if query.selectables and query.selectables[0].selectable.is_type(*_DML_TYPES):
+            for alias in _dml_target_aliases(
+                query.selectables[0].selectable, query.dialect.name
+            ):
+                if _is_subquery_target_alias(alias, subquery):
+                    continue
+                if alias.ref_str and alias.ref_str not in seen_ref_strs:
+                    seen_ref_strs.add(alias.ref_str)
+                    yield alias
 
     @property
     def _may_add_qualifiers(self) -> bool:
@@ -292,6 +313,81 @@ def _is_lateral_element(element: BaseSegment) -> bool:
         and parent.is_type("join_clause")
         and any(seg.raw_upper == "APPLY" for seg in parent.get_children("keyword"))
     )
+
+
+def _is_subquery_target_alias(alias: AliasInfo, subquery: Optional[Query]) -> bool:
+    """Check whether an alias is the derived table containing a subquery."""
+    return bool(
+        subquery
+        and alias.from_expression_element.is_type("from_expression_element")
+        and alias.from_expression_element.path_to(subquery.selectables[0].selectable)
+    )
+
+
+def _dml_target_aliases(dml: BaseSegment, dialect_name: str) -> list[AliasInfo]:
+    """Get the tables visible inside a DML statement.
+
+    The DML target is always visible to its subqueries. Some dialects also
+    accept a FROM clause (T-SQL ``UPDATE ... FROM``, MySQL multi-table
+    updates), whose tables are visible too. ``SELECT`` handling reads these
+    from ``SelectStatementColumnsAndTables``, but DML statements don't expose
+    them in the same way.
+    """
+    aliases: list[AliasInfo] = [
+        alias for _, alias in get_from_clause_aliases(dml, dialect_name)
+    ]
+    for from_clause in dml.get_children("from_clause"):
+        aliases.extend(
+            alias for _, alias in get_from_clause_aliases(from_clause, dialect_name)
+        )
+    for table_reference in dml.get_children("table_reference"):
+        alias_expression = _next_alias_expression(table_reference)
+        if alias_expression:
+            identifier = alias_expression.get_child("identifier")
+            if identifier:
+                aliases.append(
+                    AliasInfo(
+                        identifier.raw_normalized(casefold=False),
+                        identifier,
+                        True,
+                        dml,
+                        alias_expression,
+                        table_reference,
+                    )
+                )
+                continue
+        references = list(iter_raw_references(table_reference, dialect_name))
+        if references:
+            last_reference = references[-1]
+            aliases.append(
+                AliasInfo(
+                    last_reference.part,
+                    last_reference.segments[0],
+                    False,
+                    dml,
+                    None,
+                    table_reference,
+                )
+            )
+    return aliases
+
+
+def _next_alias_expression(
+    table_reference: BaseSegment,
+) -> Optional[BaseSegment]:
+    """Get the alias expression directly following a table reference."""
+    parent = _parent_segment(table_reference)
+    if not parent:  # pragma: no cover
+        return None
+    siblings = parent.segments
+    try:
+        index = siblings.index(table_reference)
+    except ValueError:  # pragma: no cover
+        return None
+    for sibling in siblings[index + 1 :]:
+        if sibling.is_code:
+            return sibling if sibling.is_type("alias_expression") else None
+    return None  # pragma: no cover
 
 
 def _normalized_parts(reference: BaseSegment, dialect_name: str) -> tuple[str, ...]:
